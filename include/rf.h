@@ -175,14 +175,8 @@
 #define  NRF24L01_DI_STATUS_RX_DR                ((uint8_t)0x40)             /*!< Data Ready RX FIFO interrupt */
 
 #define  NRF24L01_DI_OBSERVE_TX                  ((uint8_t)0xFF)             /*!< TRANSMIT OBSERVE REGISTER BIT MASK */
-#define  NRF24L01_DI_ARC_CNT_0                   ((uint8_t)0x01)             /*!< Count retransmitted packets bit 0 */
-#define  NRF24L01_DI_ARC_CNT_1                   ((uint8_t)0x02)             /*!< Count retransmitted packets bit 1 */
-#define  NRF24L01_DI_ARC_CNT_2                   ((uint8_t)0x04)             /*!< Count retransmitted packets bit 2 */
-#define  NRF24L01_DI_ARC_CNT_3                   ((uint8_t)0x08)             /*!< Count retransmitted packets bit 3 */
-#define  NRF24L01_DI_PLOS_CNT_0                  ((uint8_t)0x10)             /*!< Count lost packets bit 0 */
-#define  NRF24L01_DI_PLOS_CNT_1                  ((uint8_t)0x20)             /*!< Count lost packets bit 1 */
-#define  NRF24L01_DI_PLOS_CNT_2                  ((uint8_t)0x40)             /*!< Count lost packets bit 2 */
-#define  NRF24L01_DI_PLOS_CNT_3                  ((uint8_t)0x80)             /*!< Count lost packets bit 3 */
+#define  NRF24L01_DI_ARC_CNT                     ((uint8_t)0x0F)             /*!< Count retransmitted packets */
+#define  NRF24L01_DI_PLOS_CNT                    ((uint8_t)0xF0)             /*!< Count lost packets */
 
 #define  NRF24L01_DI_CD                          ((uint8_t)0x01)             /*!< REGISTER BIT MASK */
 #define  NRF24L01_DI_CARRIER_DETECT              ((uint8_t)0x01)             /*!< Carrier detect */
@@ -459,6 +453,10 @@ typedef  enum {
   NRF24L01_DPL_disabled = 0x00           /*!< EN_DPL disabled */
 } NRF24L01_DPL_t;
 
+typedef enum {
+	NRF24L01_AutoAck_enabled = 0x3F,
+	NRF24L01_AutoAck_disabled = 0
+} NRF24L01_AutoAck_t;
 /**
  * @brief   RF Transceiver Dynamic Acknowledge with Payload enabler
  *
@@ -480,6 +478,17 @@ typedef  enum {
 } NRF24L01_DYN_ACK_t;
 
 /**
+ * @brief   RF Transceiver CRC enabler
+ *
+ * @details Enables the W_TX_PAYLOAD_NOACK command
+ */
+typedef  enum {
+	NRF24L01_CRC_16bit     = NRF24L01_DI_CONFIG_EN_CRC | NRF24L01_DI_CONFIG_CRCO, /*!< 8 bit CRC */
+	NRF24L01_CRC_8bit    = NRF24L01_DI_CONFIG_EN_CRC, /*< 16 bit CRC */
+	NRF24L01_CRC_disabled = 0x00
+} NRF24L01_CRC_t;
+
+/**
  * @brief   Driver possible messages.
  */
 typedef enum {
@@ -488,6 +497,12 @@ typedef enum {
   RF_OK =      1,                    /**< Error.                             */
   RF_TIMEOUT = 2                     /**< Timeout.                           */
 } rf_msg_t;
+
+typedef struct {
+	rf_msg_t state;
+	uint8_t plos_cnt;
+	uint8_t arc_cnt;
+} rf_tx_status;
 
 /**
  * @brief   Driver state machine possible states.
@@ -517,6 +532,32 @@ typedef struct {
    */
   uint8_t tx_payload[RF_PAYLEN];
 } RFTxFrame;
+
+typedef struct {
+	 /**
+	   * @brief   payload lenght.
+	   */
+	  uint8_t paylen;
+	  /**
+	   * @brief   payload data structure.
+	   */
+	  uint8_t payload[RF_PAYLEN];
+} RFData;
+
+/**
+ * @brief   RF ACK frame.
+ */
+typedef struct {
+	uint8_t arc_cnt;
+	/**
+	 * @brief   ACK payload lenght.
+	 */
+	uint8_t ack_paylen;
+	/**
+	 * @brief   ACK payload data structure.
+	 */
+	uint8_t ack_payload[RF_PAYLEN];
+} RFAckFrame;
 
 /**
  * @brief   RF received frame.
@@ -602,6 +643,7 @@ typedef struct {
    * @brief RF Transceiver air data rate.
    */
   NRF24L01_ADR_t            data_rate;
+  NRF24L01_CRC_t            en_crc;
   /**
    * @brief RF Transceiver output power.
    */
@@ -615,6 +657,7 @@ typedef struct {
   */
   NRF24L01_DPL_t            en_dpl;
 
+  NRF24L01_AutoAck_t  en_auto_ack;
   /**
    * @brief   RF Transceiver Dynamic Acknowledge with Payload enabler
    */
@@ -624,6 +667,11 @@ typedef struct {
    * @brief   RF Transceiver Dynamic Acknowledge enabler
    */
   NRF24L01_DYN_ACK_t        en_dyn_ack;
+
+  systime_t                 time_out;  // The number of ticks before the operation timeouts,
+  	  	  	  	  	  	  	  	  	  // the following special values are allowed:
+  	  	  	  	  	  	  	  	  	  // - @a TIME_IMMEDIATE immediate timeout.
+  	  	  	  	  	  	  	  	  	  //    - @a TIME_INFINITE no timeout.
 } RFConfig;
 
 /**
@@ -644,6 +692,7 @@ typedef struct {
    *          IRQ mask that have occurred.
    */
   event_source_t      irq_event;
+
   /**
    * @brief   RF event listner.
    */
@@ -676,14 +725,11 @@ extern "C" {
   void rfStop(RFDriver *rfp);
   bool rfTxIsEmpty(RFDriver *rfp);
   bool rfRxIsNonEmpty(RFDriver *rfp);
-  rf_msg_t rfReceive(RFDriver *rfp, uint32_t n, RFRxFrame *prxframe,
-                     systime_t time);
-  rf_msg_t rfTransmit(RFDriver *rfp, uint32_t n, RFTxFrame *ptxframe,
-                      systime_t time);
-  rf_msg_t rfReceiveString(RFDriver *rfp, char* sp, char* addp,
-                     systime_t time);
-  rf_msg_t rfTransmitString(RFDriver *rfp, char* sp, char* addp,
-                            systime_t time);
+  rf_msg_t rfReceiveFrame(RFDriver *rfp, uint32_t n, RFRxFrame *prxframe);
+  rf_msg_t rfTransmitFrame(RFDriver *rfp, uint32_t n, RFTxFrame *txbuff, RFAckFrame *ackbuff);
+  uint8_t rfReceiveData(RFDriver *rfp, uint8_t* buffer, uint8_t buffer_size, uint8_t* addp);
+  rf_msg_t rfTransmitData(RFDriver *rfp, uint8_t* buf, uint8_t buf_len, uint8_t* addp);
+  void printDetails(RFDriver *rfp);
   void rfExtCallBack(EXTDriver *extp, expchannel_t channel);
 #if (RF_USE_MUTUAL_EXCLUSION == TRUE) || defined(__DOXYGEN__)
   void rfAcquireBus(RFDriver *rfp);

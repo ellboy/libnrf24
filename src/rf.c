@@ -32,6 +32,9 @@
  */
 
 #include "rf.h"
+
+#include "debug.h"
+
 #if USERLIB_USE_RF || defined(__DOXYGEN__)
 
 /*===========================================================================*/
@@ -43,6 +46,7 @@
 #define  NRF24L01_MAX_PPP                        ((uint8_t)  5)
 
 #define ACTIVATE                                 0x73
+
 
 /**
  * @brief   Resets all Status flags.
@@ -119,6 +123,17 @@ static uint8_t nrf24l01ReadRegister(SPIDriver *spip, uint8_t reg,
   spiSelect(spip);
   spiExchange(spip, 1, &txbuf, &status);
   spiReceive(spip, 1, pvalue);
+  spiUnselect(spip);
+  return status;
+}
+
+static uint8_t nrf24l01ReadRegisterRange(SPIDriver *spip, uint8_t reg,
+                                       uint8_t* pvalue, uint8_t range) {
+  uint8_t txbuf = (NRF24L01_CMD_READ | reg);
+  uint8_t status = 0xFF;
+  spiSelect(spip);
+  spiExchange(spip, 1, &txbuf, &status);
+  spiReceive(spip, range, pvalue);
   spiUnselect(spip);
   return status;
 }
@@ -267,8 +282,7 @@ static uint8_t nrf24l01WriteAddress(SPIDriver *spip, uint8_t reg,
  *
  * @return              the status register value
  */
-static uint8_t nrf24l01GetRxPl(SPIDriver *spip, uint8_t paylen,
-                                  uint8_t* rxbuf) {
+static uint8_t nrf24l01GetRxPl(SPIDriver *spip, uint8_t paylen, uint8_t* rxbuf) {
 
   uint8_t txbuf = NRF24L01_CMD_R_RX_PAYLOAD;
   uint8_t status;
@@ -308,6 +322,7 @@ static uint8_t nrf24l01WriteTxPl(SPIDriver *spip, uint8_t paylen,
   spiUnselect(spip);
   return status;
 }
+
 
 /**
  * @brief   Flush TX FIFO.
@@ -451,14 +466,16 @@ void rfStart(RFDriver *rfp, RFConfig *config) {
   //To do check why osal has not this call
   chEvtRegister(&rfp->irq_event, &rfp->el, 0);
   extStart(rfp->config->extp, rfp->config->extcfg);
+  //extChannelEnable(&EXTD1, INT0);
+  //extChannelEnable(rfp->config->extp, 1);
   spiStart(rfp->config->spip, rfp->config->spicfg);
 
   nrf24l01Reset(rfp->config->spip);
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_CONFIG,
-                        NRF24L01_DI_CONFIG_PWR_UP | NRF24L01_DI_CONFIG_EN_CRC);
+		                rfp->config->en_crc | NRF24L01_DI_CONFIG_PWR_UP);
   osalThreadSleepMilliseconds(2);
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_EN_AA,
-                        NRF24L01_DI_EN_AA);
+                        rfp->config->en_auto_ack);
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_EN_RXADDR,
                         NRF24L01_DI_EN_RXADDR);
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_RF_CH,
@@ -473,13 +490,19 @@ void rfStart(RFDriver *rfp, RFConfig *config) {
                         rfp->config->out_pwr |
                         rfp->config->lna);
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_FEATURE,
-                        NRF24L01_DI_FEATURE_EN_DPL);
+                        rfp->config->en_dyn_ack | rfp->config->en_ack_pay | rfp->config->en_dpl);
   nrf24l01Activate(rfp->config->spip);
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_DYNPD,
-                        NRF24L01_DI_DYNPD);
+                        NRF24L01_DI_DYNPD); // dynamic payload on all pipes
+
+  nrf24l01FlushRx(rfp->config->spip);
+  nrf24l01FlushTx(rfp->config->spip);
 
   palClearPad(rfp->config->ceport, rfp->config->cepad);
   rfp->state = RF_READY;
+
+  printDetails(rfp);
+
 }
 
 /**
@@ -556,8 +579,7 @@ bool rfRxIsNonEmpty(RFDriver *rfp) {
  * @retval RF_ERROR      Error during the transmission.
  * @api
  */
-rf_msg_t rfReceive(RFDriver *rfp, uint32_t n, RFRxFrame *rxbuff,
-                   systime_t time) {
+rf_msg_t rfReceiveFrame(RFDriver *rfp, uint32_t n, RFRxFrame *rxbuff) {
 
   uint8_t status;
   uint32_t cnt;
@@ -566,29 +588,37 @@ rf_msg_t rfReceive(RFDriver *rfp, uint32_t n, RFRxFrame *rxbuff,
 
   osalDbgAssert((rfp->state == RF_READY),
               "rfReceive(), invalid state");
+
   nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_CONFIG,
                         NRF24L01_DI_CONFIG_PWR_UP |
-                        NRF24L01_DI_CONFIG_EN_CRC |
+                        rfp->config->en_crc |
                         NRF24L01_DI_CONFIG_PRIM_RX);
-  nrf24l01WriteAddress(rfp->config->spip, NRF24L01_AD_TX_ADDR,
-                       rxbuff->rx_address, RF_ADDLEN);
+
+//  nrf24l01WriteAddress(rfp->config->spip, NRF24L01_AD_TX_ADDR, TODO Why tX addr?
+//                       rxbuff->rx_address, RF_ADDLEN);
   nrf24l01WriteAddress(rfp->config->spip,
                        NRF24L01_AD_RX_ADDR_P1,
                        rxbuff->rx_address, RF_ADDLEN);
   nrf24l01FlushRx(rfp->config->spip);
   nrf24l01Reset(rfp->config->spip);
   cnt = 0;
+  //print_status(nrf24l01GetStatus(rfp->config->spip));
+  //printDetails(rfp);
   rfp->state = RF_RX;
   palSetPad(rfp->config->ceport, rfp->config->cepad);
+  //printDetails(rfp);
   while(cnt < n) {
-    if(chEvtWaitOneTimeout(ALL_EVENTS, time) == 0) {
+    if(chEvtWaitOneTimeout(ALL_EVENTS, rfp->config->time_out) == 0) {
         rfp->state = RF_READY;
         palClearPad(rfp->config->ceport, rfp->config->cepad);
+        //print_dbg("timeout\r\n");
         return RF_TIMEOUT;
     }
+    //print_dbg("irq\r\n");
     status = nrf24l01GetStatus(rfp->config->spip);
     if (((status & NRF24L01_DI_STATUS_RX_DR) ||
         (status & NRF24L01_DI_STATUS_TX_DS)) && (rfRxIsNonEmpty(rfp))) {
+
       nrf24l01ReadRxPlWid(rfp->config->spip, &(rxbuff + cnt)->rx_paylen);
       osalDbgCheck((rxbuff + cnt)->rx_paylen <= RF_PAYLEN);
       nrf24l01GetRxPl(rfp->config->spip, (rxbuff + cnt)->rx_paylen,
@@ -627,60 +657,93 @@ rf_msg_t rfReceive(RFDriver *rfp, uint32_t n, RFRxFrame *rxbuff,
  * @retval RF_ERROR      Error during the transmission.
  * @api
  */
-rf_msg_t rfTransmit(RFDriver *rfp, uint32_t n, RFTxFrame *txbuff,
-                    systime_t time) {
-  uint8_t status;
-  uint32_t cnt;
-  bool flag;
-  osalDbgCheck((rfp != NULL) && (txbuff != NULL));
+rf_msg_t rfTransmitFrame(RFDriver *rfp, uint32_t n, RFTxFrame *txbuff, RFAckFrame *ackbuff) {
+	uint8_t status;
+	uint32_t cnt;
+	bool flag;
+	rf_msg_t ret = RF_OK;
+	uint8_t buffer;
 
-  osalDbgAssert((rfp->state == RF_READY),
-              "rfTransmit(), invalid state");
-  nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_CONFIG,
-                        NRF24L01_DI_CONFIG_PWR_UP |
-                        NRF24L01_DI_CONFIG_EN_CRC);
-  nrf24l01WriteAddress(rfp->config->spip, NRF24L01_AD_TX_ADDR,
-                       txbuff->tx_address, RF_ADDLEN);
-  nrf24l01WriteAddress(rfp->config->spip,
-                       NRF24L01_AD_RX_ADDR_P0,
-                       txbuff->tx_address, RF_ADDLEN);
-  nrf24l01Reset(rfp->config->spip);
-  nrf24l01FlushTx(rfp->config->spip);
-  cnt = 0;
-  flag = TRUE;
-  rfp->state = RF_TX;
-  while(cnt < n) {
-    if(rfTxIsEmpty(rfp) && flag) {
-      osalDbgCheck((txbuff + cnt)->tx_paylen <= RF_PAYLEN);
-      nrf24l01WriteTxPl(rfp->config->spip, (txbuff + cnt)->tx_paylen,
-                        (txbuff + cnt)->tx_payload);
-      palSetPad(rfp->config->ceport, rfp->config->cepad);
-      osalThreadSleepMilliseconds(1);
-      palClearPad(rfp->config->ceport, rfp->config->cepad);
-      flag = FALSE;
-    }
-    if(chEvtWaitOneTimeout(ALL_EVENTS, time) == 0) {
-      rfp->state = RF_READY;
-      palClearPad(rfp->config->ceport, rfp->config->cepad);
-      return RF_TIMEOUT;
-    }
-    status = nrf24l01GetStatus(rfp->config->spip);
-    if (status & NRF24L01_DI_STATUS_TX_DS) {
-      nrf24l01Reset(rfp->config->spip);
-      flag = TRUE;
-      cnt++;
-      continue;
-    }
-    if (status & NRF24L01_DI_STATUS_MAX_RT) {
-      nrf24l01Reset(rfp->config->spip);
-      rfp->state = RF_READY;
-      palClearPad(rfp->config->ceport, rfp->config->cepad);
-      return RF_ERROR;
-    }
-  }
-  rfp->state = RF_READY;
-  palClearPad(rfp->config->ceport, rfp->config->cepad);
-  return RF_OK;
+	osalDbgCheck((rfp != NULL) && (txbuff != NULL));
+
+	osalDbgAssert((rfp->state == RF_READY), "rfTransmit(), invalid state");
+	nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_CONFIG,
+	NRF24L01_DI_CONFIG_PWR_UP | rfp->config->en_crc);
+
+	nrf24l01WriteAddress(rfp->config->spip, NRF24L01_AD_TX_ADDR,
+			txbuff->tx_address, RF_ADDLEN);
+	nrf24l01WriteAddress(rfp->config->spip, NRF24L01_AD_RX_ADDR_P0,
+			txbuff->tx_address, RF_ADDLEN);
+
+	nrf24l01Reset(rfp->config->spip);
+
+	cnt = 0;
+	flag = TRUE;
+	rfp->state = RF_TX;
+
+	//print_dbg("\r\nrfTransmit\r\n");
+	while (cnt < n) {
+		if (rfTxIsEmpty(rfp) && flag) {
+			osalDbgCheck((txbuff + cnt)->tx_paylen <= RF_PAYLEN);
+			nrf24l01WriteTxPl(rfp->config->spip, (txbuff + cnt)->tx_paylen,
+					(txbuff + cnt)->tx_payload);
+			palSetPad(rfp->config->ceport, rfp->config->cepad);
+			osalThreadSleepMilliseconds(1);
+			palClearPad(rfp->config->ceport, rfp->config->cepad);
+			flag = FALSE;
+		}
+
+		if (chEvtWaitOneTimeout(ALL_EVENTS, rfp->config->time_out) == 0) {
+			ret = RF_TIMEOUT;
+			break;
+		}
+
+		status = nrf24l01GetStatus(rfp->config->spip);
+
+		// Data Send TX FIFO interrupt
+		if (status & NRF24L01_DI_STATUS_TX_DS) {
+			nrf24l01Reset(rfp->config->spip);
+			flag = TRUE;
+			cnt++;
+
+			if (rfp->config->en_ack_pay == NRF24L01_ACK_PAY_enabled) {
+				if (rfRxIsNonEmpty(rfp)) {
+					nrf24l01ReadRegister(rfp->config->spip, NRF24L01_AD_OBSERVE_TX, &buffer);
+					(ackbuff + cnt)->arc_cnt = buffer & NRF24L01_DI_ARC_CNT;
+					nrf24l01ReadRxPlWid(rfp->config->spip, &(ackbuff + cnt)->ack_paylen);
+
+					osalDbgCheck((ackbuff + cnt)->ack_paylen <= RF_PAYLEN);
+					nrf24l01GetRxPl(rfp->config->spip, (ackbuff + cnt)->ack_paylen,
+							(ackbuff + cnt)->ack_payload);
+					print_dbg("ack len = %d, arc = %d\r\n", (ackbuff + cnt)->ack_paylen, (ackbuff + cnt)->arc_cnt);
+				}
+			}
+
+			continue;
+		}
+
+		palClearPad(rfp->config->ceport, rfp->config->cepad);
+
+		if (status & NRF24L01_DI_STATUS_MAX_RT) {
+			nrf24l01ReadRegister(rfp->config->spip, NRF24L01_AD_OBSERVE_TX, &buffer);
+			(ackbuff + cnt)->arc_cnt = buffer & NRF24L01_DI_ARC_CNT;
+			print_dbg("arc = %d\r\n", (ackbuff + cnt)->arc_cnt);
+			nrf24l01Reset(rfp->config->spip);
+			nrf24l01FlushTx(rfp->config->spip);
+			ret = RF_ERROR;
+			break;
+		}
+
+	}
+	rfp->state = RF_READY;
+
+	palClearPad(rfp->config->ceport, rfp->config->cepad);
+
+	nrf24l01WriteRegister(rfp->config->spip, NRF24L01_AD_STATUS,
+			NRF24L01_DI_CONFIG_MASK_MAX_RT | NRF24L01_DI_CONFIG_MASK_TX_DS
+					| NRF24L01_DI_CONFIG_MASK_RX_DR);
+
+	return ret;
 }
 
 /**
@@ -700,83 +763,76 @@ rf_msg_t rfTransmit(RFDriver *rfp, uint32_t n, RFTxFrame *txbuff,
  * @retval RF_ERROR      Error during the transmission.
  * @api
  */
-rf_msg_t rfReceiveString(RFDriver *rfp, char* sp, char* addp,
-                   systime_t time) {
+uint8_t rfReceiveData(RFDriver *rfp, uint8_t* buffer, uint8_t buffer_size, uint8_t* addp) {
   RFRxFrame _rxframe;
+  _rxframe.rx_paylen = 0;
   rf_msg_t msg;
-  unsigned i;
-  osalDbgCheck((rfp != NULL) && (sp != NULL) && (addp != NULL));
+  uint8_t i;
+  osalDbgCheck((rfp != NULL) && (buffer != NULL) && (addp != NULL) && (buffer_size >= RF_PAYLEN));
 
   osalDbgAssert((rfp->state == RF_READY),
               "rfReceive(), invalid state");
-  if(strlen(addp) < RF_ADDLEN){
-    *sp = '\0';
-    return RF_ERROR;
-  }
-  for (i = 0; i < RF_ADDLEN; i++) {
-    _rxframe.rx_address[i] = (uint8_t)*addp;
+
+  for (i = 0; i < (uint8_t)rfp->config->address_width + 2; i++) {
+    _rxframe.rx_address[i] = *addp;
     addp++;
   }
-  _rxframe.rx_paylen = RF_PAYLEN;
-  msg = rfReceive(rfp, 1, &_rxframe, time);
-  if(msg == RF_OK){
-    for (i = 0; i < RF_PAYLEN; i++) {
-      if(_rxframe.rx_payload[i] == '\0'){
-        *sp = '\0';
-        return msg;
-      }
-      else{
-        *sp = _rxframe.rx_payload[i];
-        sp++;
-      }
-    }
-    *sp = '\0';
-  }
-  return msg;
+
+	msg = rfReceiveFrame(rfp, 1, &_rxframe);
+	if (msg == RF_OK) {
+		//print_dbg("paylen: %d\r\n", _rxframe.rx_paylen);
+		for (i = 0; i < _rxframe.rx_paylen; i++) {
+			*buffer = _rxframe.rx_payload[i];
+			buffer++;
+		}
+
+	} else {
+		//print_dbg("NOK: %d\r\n", msg);
+	}
+
+	return _rxframe.rx_paylen;
 }
 
 /**
- * @brief   Transmits a string from an addressed channel.
+ * @brief   Transmits data from an addressed channel.
  *
  * @param[in] rfp        Pointer to the @p RFDriver object
- * @param[in] sp         String pointer. String cannot be longer than
+ * @param[in] buffer     Send buffer. The size of the buffer cannot be longer than
+ *                       RF_PAYLEN
+ * @param[in] buffer_size Send buffer size. The size of the buffer cannot be longer than
  *                       RF_PAYLEN
  * @param[in] addp       Channel address as string
- * @param[in] time       The number of ticks before the operation timeouts,
- *                       the following special values are allowed:
- *                      - @a TIME_IMMEDIATE immediate timeout.
- *                      - @a TIME_INFINITE no timeout.
  *
  * @return               The operation result.
  * @retval RF_OK         The operation succeeds.
  * @retval RF_ERROR      Error during the transmission.
  * @api
  */
-rf_msg_t rfTransmitString(RFDriver *rfp, char* sp, char* addp,
-                          systime_t time){
+rf_msg_t rfTransmitData(RFDriver *rfp, uint8_t* buffer, uint8_t buffer_size, uint8_t* addp){
 
   RFTxFrame _txframe;
+  RFAckFrame _ackframe;
   rf_msg_t msg;
-  unsigned i;
-  uint32_t len = strlen(sp);
-  uint8_t* p = (uint8_t*)addp;
-  osalDbgCheck((rfp != NULL) && (sp != NULL) && (addp != NULL));
+  uint8_t i;
 
-  osalDbgAssert((rfp->state == RF_READY),
-              "rfReceive(), invalid state");
-  for (i = 0; i < 5; i++) {
-    _txframe.tx_address[i] = (uint8_t)*p ;
-    p++;
+  osalDbgCheck((rfp != NULL) && (buffer != NULL) && (addp != NULL));
+  osalDbgAssert((rfp->state == RF_READY), "rfReceive(), invalid state");
+
+  for (i = 0; i < (uint8_t)rfp->config->address_width + 2; i++) {
+    _txframe.tx_address[i] = *addp ;
+    addp++;
   }
-  _txframe.tx_paylen = RF_PAYLEN;
-  if (len > RF_MAX_STRLEN)
-    len = RF_MAX_STRLEN;
-  for(i = 0; i < len; i++){
-    _txframe.tx_payload[i] = *sp ;
-    sp++;
+
+  if (buffer_size > RF_PAYLEN)
+	  buffer_size = RF_PAYLEN;
+
+  _txframe.tx_paylen = buffer_size;
+
+  for(i = 0; i < buffer_size; i++){
+    _txframe.tx_payload[i] = *buffer ;
+    buffer++;
   }
-  _txframe.tx_payload[len] = '\0' ;
-  msg = rfTransmit(rfp, 1, &_txframe, time);
+  msg = rfTransmitFrame(rfp, 1, &_txframe, &_ackframe);
   return msg;
 }
 
@@ -788,6 +844,7 @@ rf_msg_t rfTransmitString(RFDriver *rfp, char* sp, char* addp,
 void rfExtCallBack(EXTDriver *extp, expchannel_t channel) {
 
   (void) extp;
+  //palToggleLine(LINE_LED_GREEN);
   osalSysLockFromISR();
   cbcounter++;
 
@@ -832,6 +889,148 @@ void rfReleaseBus(RFDriver *rfp) {
   osalMutexUnlock(&rfp->mutex);
 }
 #endif /* RF_USE_MUTUAL_EXCLUSION == TRUE */
+
+NRF24L01_ADR_t getDataRate( RFDriver *rfp )
+{
+  //rf24_datarate_e result ;
+
+  uint8_t buffer;
+  nrf24l01ReadRegister(rfp->config->spip, NRF24L01_AD_RF_SETUP, &buffer);
+  return buffer & NRF24L01_DI_RF_SETUP_RF_DR;
+
+}
+
+char *DataRateToString(NRF24L01_ADR_t dr) {
+	if(dr == NRF24L01_ADR_1Mbps) {
+		return "1MBPS";
+	} else if (dr == NRF24L01_ADR_2Mbps) {
+		return "2MBS";
+	} else {
+		return "UNKNOWN";
+	}
+}
+
+NRF24L01_CRC_t getCrcLength(RFDriver *rfp) {
+	//rf24_datarate_e result ;
+	NRF24L01_CRC_t crc = NRF24L01_CRC_disabled;
+
+	uint8_t config;
+	uint8_t aa;
+	nrf24l01ReadRegister(rfp->config->spip, NRF24L01_AD_RF_SETUP, &config);
+	config = config & (NRF24L01_DI_CONFIG_CRCO | NRF24L01_DI_CONFIG_EN_CRC);
+	nrf24l01ReadRegister(rfp->config->spip, NRF24L01_AD_EN_AA, &aa);
+
+	if(config & NRF24L01_DI_CONFIG_EN_CRC || aa){
+		if(config & NRF24L01_DI_CONFIG_CRCO) {
+			return NRF24L01_CRC_16bit;
+		} else {
+			return NRF24L01_CRC_8bit;
+		}
+	}
+
+	return crc;
+}
+
+char *crcLengthToString(NRF24L01_CRC_t crc) {
+	if (crc == NRF24L01_CRC_disabled) {
+		return "Disabled";
+	} else if (crc == NRF24L01_CRC_16bit) {
+		return "16 bits";
+	} else {
+		return "8 bits";
+	}
+}
+
+
+void print_status(uint8_t status)
+{
+  print_dbg("STATUS\t\t = 0x%02x RX_DR=%x TX_DS=%x MAX_RT=%x RX_P_NO=%x TX_FULL=%x\r\n",
+           status,
+           (status & NRF24L01_DI_STATUS_RX_DR)?1:0,
+           (status & NRF24L01_DI_STATUS_TX_DS)?1:0,
+           (status & NRF24L01_DI_STATUS_MAX_RT)?1:0,
+           ((status >> 1) & 0x07),
+           (status & NRF24L01_DI_STATUS_TX_FULL)?1:0
+          );
+}
+
+void print_fifo_status(uint8_t status)
+  {
+    print_dbg("FIFO STATUS\t\t = 0x%02x TX_REUSE=%x TX_FULL=%x TX_EMPTY=%x RX_FULL=%x RX_EMPTY=%x\r\n",
+             status,
+             (status & NRF24L01_DI_FIFO_STATUS_TX_REUSE)?1:0,
+             (status & NRF24L01_DI_FIFO_STATUS_TX_FULL)?1:0,
+             (status & NRF24L01_DI_FIFO_STATUS_TX_EMPTY)?1:0,
+             (status & NRF24L01_DI_FIFO_STATUS_RX_FULL)?1:0,
+             (status & NRF24L01_DI_FIFO_STATUS_RX_EMPTY)?1:0
+            );
+  }
+
+void print_address_register(RFDriver *rfp, const char* name, uint8_t reg, uint8_t qty)
+{
+    print_dbg("%s\t =",name);
+
+  while (qty--)
+  {
+	  // TODO buffer size
+    uint8_t buffer[5];
+    nrf24l01ReadRegisterRange(rfp->config->spip, reg++,buffer, rfp->config->address_width);
+
+    print_dbg(" 0x");
+    uint8_t* bufptr = buffer + rfp->config->address_width;
+    while( --bufptr >= buffer )
+      print_dbg("%02x",*bufptr);
+
+    //print_dbg("(%s)", buffer);
+
+  }
+
+  print_dbg("\r\n");
+}
+
+void print_byte_register(RFDriver *rfp, const char* name, uint8_t reg, uint8_t qty)
+{
+	print_dbg("%s(0x%02x)\t =", name, reg);
+
+	uint8_t buffer;
+  while (qty--) {
+
+	      nrf24l01ReadRegister(rfp->config->spip, reg++,&buffer);
+	      print_dbg(" 0x%02x", buffer);
+
+  }
+  print_dbg("\r\n");
+}
+
+
+void printDetails(RFDriver *rfp)
+{
+	uint8_t buffer;
+
+  print_status(nrf24l01GetStatus(rfp->config->spip));
+
+  print_address_register(rfp, "RX_ADDR_P0-1",NRF24L01_AD_RX_ADDR_P0,2);
+  print_byte_register(rfp, "RX_ADDR_P2-5",NRF24L01_AD_RX_ADDR_P2,4);
+  print_address_register(rfp, "TX_ADDR\t",NRF24L01_AD_TX_ADDR, 1);
+//
+//  print_byte_register(PSTR("RX_PW_P0-6"),RX_PW_P0,6);
+  print_byte_register(rfp, "EN_AA\t",NRF24L01_AD_EN_AA, 1);
+  print_byte_register(rfp, "EN_RXADDR" ,NRF24L01_AD_EN_RXADDR, 1);
+//  print_byte_register(rfp, "RF_CH\t",NRF24L01_AD_RF_CH, 1);
+//  print_byte_register(rfp, "RF_SETUP",NRF24L01_AD_RF_SETUP, 1);
+  print_byte_register(rfp, "CONFIG\t",NRF24L01_AD_CONFIG, 1);
+  print_byte_register(rfp, "DYNPD/FEATURE",NRF24L01_AD_DYNPD,2);
+
+  nrf24l01ReadRegister(rfp->config->spip, NRF24L01_AD_FIFO_STATUS,&buffer);
+  print_fifo_status(buffer);
+
+  print_dbg("Data Rate\t = %s\r\n", DataRateToString(getDataRate(rfp)));
+//  printf_P(PSTR("Model\t\t = " PRIPSTR "\r\n"),pgm_read_word(&rf24_model_e_str_P[isPVariant()]));
+  print_dbg("CRC Length\t = %s\r\n", crcLengthToString(getCrcLength(rfp)));
+//  printf_P(PSTR("PA Power\t = " PRIPSTR "\r\n"),  pgm_read_word(&rf24_pa_dbm_e_str_P[getPALevel()]));
+
+}
+
 #endif /* USERLIB_USE_RF */
 
 /** @} */

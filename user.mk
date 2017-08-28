@@ -1,4 +1,5 @@
-USERLIB = ./userlib
+USERLIB = $(CURDIR)
+$(info VAR="$(USERLIB)")
 # List of all the Userlib files
 USERSRC =  $(USERLIB)/src/rf.c 
           
